@@ -194,19 +194,14 @@ impl BM25Index {
     }
 
     /// Search restricted to a subset of document IDs (pre-filtering).
-    /// Only documents whose index is in `allowed_ids` will be scored.
+    /// Only documents whose index is in `subset` will be scored.
     /// IDF is computed from global corpus stats so scores stay comparable.
     ///
     /// Uses a doc-centric approach: iterates allowed IDs and looks up each doc's
     /// TF via binary search on posting lists. Cost is O(|allowed| * |query_terms| * log(posting_len))
     /// which is much faster than scanning full posting lists when |allowed| is small.
-    pub fn search_filtered(
-        &self,
-        query: &str,
-        k: usize,
-        allowed_ids: &[usize],
-    ) -> Vec<SearchResult> {
-        if self.num_docs == 0 || allowed_ids.is_empty() {
+    pub fn search_filtered(&self, query: &str, k: usize, subset: &[usize]) -> Vec<SearchResult> {
+        if self.num_docs == 0 || subset.is_empty() {
             return Vec::new();
         }
 
@@ -247,7 +242,7 @@ impl BM25Index {
         // Doc-centric scoring: for each allowed doc, look up TF via binary search.
         // Cost: O(|allowed| * |query_terms| * log(posting_len))
         let mut heap = BinaryHeap::with_capacity(k + 1);
-        for &doc_idx in allowed_ids {
+        for &doc_idx in subset {
             let doc_id = doc_idx as u32;
             if doc_id >= self.next_doc_id {
                 continue;

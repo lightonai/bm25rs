@@ -37,10 +37,10 @@ impl PyBM25Index {
     }
 
     /// Search the index. Returns list of (index, score) tuples.
-    /// If `allowed_ids` is provided, only those document IDs are scored (pre-filtering).
-    #[pyo3(signature = (query, k, allowed_ids=None))]
-    fn search(&self, query: &str, k: usize, allowed_ids: Option<Vec<usize>>) -> Vec<(usize, f32)> {
-        let results = match allowed_ids {
+    /// If `subset` is provided, only those document IDs are scored (pre-filtering).
+    #[pyo3(signature = (query, k, subset=None))]
+    fn search(&self, query: &str, k: usize, subset: Option<Vec<usize>>) -> Vec<(usize, f32)> {
+        let results = match subset {
             Some(ids) => self.inner.search_filtered(query, k, &ids),
             None => self.inner.search(query, k),
         };
@@ -58,17 +58,17 @@ impl PyBM25Index {
     }
 
     /// Save the index to a directory.
-    fn save(&self, path: &str) -> PyResult<()> {
+    fn save(&self, index: &str) -> PyResult<()> {
         self.inner
-            .save(path)
+            .save(index)
             .map_err(|e| PyValueError::new_err(format!("Save failed: {}", e)))
     }
 
     /// Load an index from a directory.
     #[staticmethod]
-    #[pyo3(signature = (path, mmap=false))]
-    fn load(path: &str, mmap: bool) -> PyResult<Self> {
-        let inner = BM25Index::load(path, mmap)
+    #[pyo3(signature = (index, mmap=false))]
+    fn load(index: &str, mmap: bool) -> PyResult<Self> {
+        let inner = BM25Index::load(index, mmap)
             .map_err(|e| PyValueError::new_err(format!("Load failed: {}", e)))?;
         Ok(PyBM25Index { inner })
     }
