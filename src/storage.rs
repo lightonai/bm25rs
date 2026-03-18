@@ -108,6 +108,18 @@ impl MmapData {
         }
     }
 
+    pub fn doc_lens_bytes(&self) -> &[u8] {
+        &self.doc_lens_mmap
+    }
+
+    pub fn postings_bytes(&self) -> &[u8] {
+        &self.postings_mmap
+    }
+
+    pub fn offsets_bytes(&self) -> &[u8] {
+        &self.offsets_mmap
+    }
+
     /// Binary search for a specific doc_id in a term's posting list.
     pub fn get_tf(&self, term_id: u32, doc_id: u32) -> Option<u32> {
         if term_id >= self.num_terms {
@@ -153,33 +165,37 @@ impl BM25Index {
         };
         write_bytes(dir.join("header.bin"), as_bytes(&header))?;
 
-        // Write doc_lengths
-        write_bytes(
-            dir.join("doc_lens.bin"),
-            as_slice_bytes(self.get_doc_lengths_slice()),
-        )?;
+        if self.get_mmap_data().is_some() {
+            // Mmap-backed: the binary files on disk are already up to date.
+            // Only metadata (header, vocab, deleted) needs rewriting — done below.
+        } else {
+            // In-memory path: serialize from Vec data
+            write_bytes(
+                dir.join("doc_lens.bin"),
+                as_slice_bytes(self.get_doc_lengths_slice()),
+            )?;
 
-        // Build flat postings and offsets
-        let num_terms = self.get_vocab().len();
-        let postings = self.get_postings();
-        let mut flat_postings: Vec<PostingEntry> = Vec::new();
-        let mut offsets: Vec<TermOffset> = Vec::with_capacity(num_terms);
+            let num_terms = self.get_vocab().len();
+            let postings = self.get_postings();
+            let mut flat_postings: Vec<PostingEntry> = Vec::new();
+            let mut offsets: Vec<TermOffset> = Vec::with_capacity(num_terms);
 
-        for entries in postings.iter().take(num_terms) {
-            let byte_offset = flat_postings.len() * std::mem::size_of::<PostingEntry>();
-            let count = entries.len() as u32;
-            for &(doc_id, tf) in entries {
-                flat_postings.push(PostingEntry { doc_id, tf });
+            for entries in postings.iter().take(num_terms) {
+                let byte_offset = flat_postings.len() * std::mem::size_of::<PostingEntry>();
+                let count = entries.len() as u32;
+                for &(doc_id, tf) in entries {
+                    flat_postings.push(PostingEntry { doc_id, tf });
+                }
+                offsets.push(TermOffset {
+                    offset: byte_offset as u64,
+                    count,
+                    _pad: 0,
+                });
             }
-            offsets.push(TermOffset {
-                offset: byte_offset as u64,
-                count,
-                _pad: 0,
-            });
-        }
 
-        write_bytes(dir.join("postings.bin"), as_slice_bytes(&flat_postings))?;
-        write_bytes(dir.join("offsets.bin"), as_slice_bytes(&offsets))?;
+            write_bytes(dir.join("postings.bin"), as_slice_bytes(&flat_postings))?;
+            write_bytes(dir.join("offsets.bin"), as_slice_bytes(&offsets))?;
+        }
 
         // Write vocab and deleted as bincode
         let vocab_bytes = bincode::serialize(self.get_vocab()).map_err(io::Error::other)?;

@@ -487,6 +487,10 @@ impl BM25Index {
         &self.doc_lengths
     }
 
+    pub(crate) fn get_mmap_data(&self) -> Option<&MmapData> {
+        self.mmap_data.as_ref()
+    }
+
     pub(crate) fn get_vocab(&self) -> &HashMap<String, u32> {
         &self.vocab
     }
