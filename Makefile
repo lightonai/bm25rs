@@ -27,5 +27,11 @@ release: bump-version
 test:
 	cargo test --lib
 
+test-cuda:
+	cargo test --lib --features cuda
+
 build:
 	cd python && maturin develop --release
+
+build-gpu:
+	cd python && maturin develop --release --features cuda

@@ -1,7 +1,66 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 
 use bm25x_core::{Method, TokenizerMode};
+
+/// Wrapper for a raw (*const u8, usize) string pointer pair.
+/// These are extracted under the GIL, then used after GIL release.
+/// Safety: the Python list must stay alive (keeping the strings alive)
+/// for the entire duration these are used.
+struct RawStr {
+    ptr: *const u8,
+    len: usize,
+}
+
+// Raw pointers are not Send by default, but this is safe because:
+// 1. The Python strings are immutable and reference-counted
+// 2. The list object keeps all strings alive
+// 3. We only read from these pointers, never write
+unsafe impl Send for RawStr {}
+unsafe impl Sync for RawStr {}
+
+/// Extract raw UTF-8 pointers from a Python list of strings using
+/// direct C-API calls. ~60-200ns per item vs ~2500ns for safe PyO3.
+///
+/// Safety: all items must be `str`. The returned pointers are valid
+/// as long as the Python list (and its string elements) are alive.
+fn extract_raw_ptrs(list: &Bound<'_, PyList>) -> PyResult<Vec<RawStr>> {
+    let len = list.len();
+    let mut result = Vec::with_capacity(len);
+    unsafe {
+        let list_ptr = list.as_ptr();
+        for i in 0..len as pyo3::ffi::Py_ssize_t {
+            let item = pyo3::ffi::PyList_GET_ITEM(list_ptr, i);
+            let mut size: pyo3::ffi::Py_ssize_t = 0;
+            let data = pyo3::ffi::PyUnicode_AsUTF8AndSize(item, &mut size);
+            if data.is_null() {
+                // Clear Python error state and return our own error
+                pyo3::ffi::PyErr_Clear();
+                return Err(PyValueError::new_err(format!(
+                    "element {} is not a string",
+                    i
+                )));
+            }
+            result.push(RawStr {
+                ptr: data as *const u8,
+                len: size as usize,
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Reconstruct &str slices from raw pointers.
+/// Safety: pointers must be valid (Python strings still alive).
+#[inline]
+fn raw_to_strs(ptrs: &[RawStr]) -> Vec<&str> {
+    ptrs.iter()
+        .map(|r| unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(r.ptr, r.len))
+        })
+        .collect()
+}
 
 fn parse_method(method: &str) -> PyResult<Method> {
     match method.to_lowercase().as_str() {
@@ -34,6 +93,8 @@ fn io_err(e: std::io::Error) -> PyErr {
 #[pyclass(name = "BM25")]
 struct PyBM25 {
     inner: bm25x_core::BM25,
+    #[cfg(feature = "cuda")]
+    gpu_search_index: Option<bm25x_core::cuda::GpuSearchIndex>,
 }
 
 #[pymethods]
@@ -61,22 +122,105 @@ impl PyBM25 {
             }
             None => bm25x_core::BM25::with_tokenizer(m, k1, b, delta, tok, use_stopwords),
         };
-        Ok(PyBM25 { inner })
+        Ok(PyBM25 {
+            inner,
+            #[cfg(feature = "cuda")]
+            gpu_search_index: None,
+        })
+    }
+
+    /// Upload the index to GPU for fast search. Call once after adding documents.
+    /// Subsequent search() calls will automatically use the GPU.
+    #[cfg(feature = "cuda")]
+    fn upload_to_gpu(&mut self) -> PyResult<()> {
+        self.gpu_search_index = Some(
+            self.inner
+                .to_gpu_search_index()
+                .map_err(PyValueError::new_err)?,
+        );
+        Ok(())
     }
 
     /// Add documents to the index. Returns list of assigned indices.
-    fn add(&mut self, documents: Vec<String>) -> PyResult<Vec<usize>> {
-        let refs: Vec<&str> = documents.iter().map(|s| s.as_str()).collect();
-        self.inner.add(&refs).map_err(io_err)
+    ///
+    /// Uses unsafe FFI for ~12x faster string extraction, then releases
+    /// the GIL for the entire Rust processing phase.
+    fn add(&mut self, py: Python<'_>, documents: &Bound<'_, PyList>) -> PyResult<Vec<usize>> {
+        // Phase 1: Extract raw UTF-8 pointers via C-API (~2s for 8.8M docs)
+        let ptrs = extract_raw_ptrs(documents)?;
+
+        // Phase 2: Release GIL, reconstruct &str, run Rust indexing (~11s, GIL-free)
+        let inner = &mut self.inner;
+        py.allow_threads(|| {
+            let refs = raw_to_strs(&ptrs);
+            inner.add(&refs).map_err(io_err)
+        })
+    }
+
+    /// Add documents from a newline-delimited bytes blob.
+    ///
+    /// This is the fastest path: zero-copy buffer extraction (~0.1s for 2.6GB),
+    /// then GIL-free Rust processing. Use from Python:
+    ///
+    /// ```python
+    /// index.add_bytes(b"\n".join(s.encode() for s in corpus))
+    /// # or if corpus is already List[str]:
+    /// index.add_bytes("\n".join(corpus).encode("utf-8"))
+    /// ```
+    fn add_bytes(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<Vec<usize>> {
+        let t0 = std::time::Instant::now();
+        let inner = &mut self.inner;
+        let result = py.allow_threads(|| {
+            let t_split = std::time::Instant::now();
+            let docs: Vec<&str> = data
+                .split(|&b| b == b'\n')
+                .map(|chunk| {
+                    std::str::from_utf8(chunk).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })
+                })
+                .collect::<Result<Vec<&str>, _>>()?;
+            let split_time = t_split.elapsed();
+            let t_add = std::time::Instant::now();
+            let r = inner.add(&docs);
+            let add_time = t_add.elapsed();
+            if std::env::var("BM25X_PROFILE").is_ok() {
+                eprintln!(
+                    "[add_bytes] split={:.3}s add={:.3}s docs={}",
+                    split_time.as_secs_f64(),
+                    add_time.as_secs_f64(),
+                    docs.len()
+                );
+            }
+            r
+        });
+        if std::env::var("BM25X_PROFILE").is_ok() {
+            eprintln!("[add_bytes] total={:.3}s", t0.elapsed().as_secs_f64());
+        }
+        result.map_err(io_err)
     }
 
     /// Search the index. Returns list of (index, score) tuples.
     /// If `subset` is provided, only those document IDs are scored (pre-filtering).
+    /// If to_gpu() was called, uses GPU-accelerated search.
     #[pyo3(signature = (query, k, subset=None))]
-    fn search(&self, query: &str, k: usize, subset: Option<Vec<usize>>) -> Vec<(usize, f32)> {
+    fn search(&mut self, query: &str, k: usize, subset: Option<Vec<usize>>) -> Vec<(usize, f32)> {
         let results = match subset {
             Some(ids) => self.inner.search_filtered(query, k, &ids),
-            None => self.inner.search(query, k),
+            None => {
+                #[cfg(feature = "cuda")]
+                {
+                    if let Some(ref mut gpu_idx) = self.gpu_search_index {
+                        return self
+                            .inner
+                            .search_gpu(gpu_idx, query, k)
+                            .into_iter()
+                            .map(|r| (r.index, r.score))
+                            .collect();
+                    }
+                }
+                self.inner.search(query, k)
+            }
         };
         results.into_iter().map(|r| (r.index, r.score)).collect()
     }
@@ -101,7 +245,11 @@ impl PyBM25 {
     #[pyo3(signature = (index, mmap=false))]
     fn load(index: &str, mmap: bool) -> PyResult<Self> {
         let inner = bm25x_core::BM25::load(index, mmap).map_err(io_err)?;
-        Ok(PyBM25 { inner })
+        Ok(PyBM25 {
+            inner,
+            #[cfg(feature = "cuda")]
+            gpu_search_index: None,
+        })
     }
 
     /// Score a query against a list of documents.
@@ -132,8 +280,15 @@ impl PyBM25 {
     }
 }
 
+/// Returns True if bm25x was compiled with CUDA support and a GPU is available.
+#[pyfunction]
+fn is_gpu_available() -> bool {
+    bm25x_core::is_gpu_available()
+}
+
 #[pymodule]
 fn bm25x(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBM25>()?;
+    m.add_function(wrap_pyfunction!(is_gpu_available, m)?)?;
     Ok(())
 }

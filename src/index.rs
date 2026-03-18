@@ -10,7 +10,7 @@ use crate::storage::MmapData;
 use crate::tokenizer::{Tokenizer, TokenizerMode};
 
 /// Cap rayon parallelism at 12 threads max.
-fn capped_pool() -> rayon::ThreadPool {
+pub(crate) fn capped_pool() -> rayon::ThreadPool {
     let n = std::thread::available_parallelism()
         .map(|p| p.get().min(12))
         .unwrap_or(4);
@@ -160,12 +160,43 @@ impl BM25 {
     }
 
     /// Add documents to the index. Returns the assigned document indices.
+    ///
+    /// When compiled with the `cuda` feature and a GPU is available, posting list
+    /// construction is offloaded to CUDA for faster indexing. Tokenization always
+    /// runs on CPU (rayon). Falls back to CPU automatically on GPU failure.
     pub fn add(&mut self, documents: &[&str]) -> io::Result<Vec<usize>> {
         if self.mmap_data.is_some() {
             self.materialize_mmap();
         }
 
+        // Try GPU path
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(ctx) = crate::cuda::get_global_context() {
+                match crate::cuda::add_documents_cuda(
+                    &ctx,
+                    &self.tokenizer,
+                    documents,
+                    &self.vocab,
+                    self.num_docs,
+                ) {
+                    Ok(result) => return self.apply_cuda_result(documents.len(), result),
+                    Err(e) => {
+                        eprintln!("[bm25x] CUDA indexing failed: {}, falling back to CPU", e);
+                    }
+                }
+            }
+        }
+
+        self.add_cpu(documents)
+    }
+
+    /// CPU-only add implementation (original algorithm).
+    fn add_cpu(&mut self, documents: &[&str]) -> io::Result<Vec<usize>> {
+        let t_total = std::time::Instant::now();
+
         // Phase 1: tokenize + compute TF maps in parallel
+        let t0 = std::time::Instant::now();
         let pool = capped_pool();
         let tokenized: Vec<(u32, HashMap<String, u32>)> = pool.install(|| {
             documents
@@ -181,8 +212,10 @@ impl BM25 {
                 })
                 .collect()
         });
+        let t_tokenize = t0.elapsed();
 
         // Phase 2: merge into index sequentially (cheap — just HashMap lookups + Vec pushes)
+        let t0 = std::time::Instant::now();
         let base_id = self.num_docs;
         let mut ids = Vec::with_capacity(documents.len());
 
@@ -199,8 +232,63 @@ impl BM25 {
             self.total_tokens += doc_len as u64;
             ids.push(doc_id as usize);
         }
+        let t_merge = t0.elapsed();
 
         self.num_docs = base_id + documents.len() as u32;
+
+        let t_total_elapsed = t_total.elapsed();
+        if std::env::var("BM25X_PROFILE").is_ok() {
+            eprintln!(
+                "[bm25x-cpu] {:.3}s total | tokenize={:.3}s merge={:.3}s | {:.0} d/s",
+                t_total_elapsed.as_secs_f64(),
+                t_tokenize.as_secs_f64(),
+                t_merge.as_secs_f64(),
+                documents.len() as f64 / t_total_elapsed.as_secs_f64(),
+            );
+        }
+
+        self.auto_save()?;
+        Ok(ids)
+    }
+
+    /// Apply the result from CUDA-accelerated indexing into the BM25 struct.
+    #[cfg(feature = "cuda")]
+    fn apply_cuda_result(
+        &mut self,
+        num_new_docs: usize,
+        result: crate::cuda::AddResult,
+    ) -> io::Result<Vec<usize>> {
+        let base_id = self.num_docs;
+
+        if self.num_docs == 0 && self.postings.is_empty() {
+            // Fresh index: move everything directly (O(1), no copying)
+            self.doc_freqs = result.postings.iter().map(|p| p.len() as u32).collect();
+            self.postings = result.postings;
+            self.vocab = result.vocab;
+        } else {
+            // Existing index: merge
+            let new_vocab_size = result.vocab.len();
+            while self.postings.len() < new_vocab_size {
+                self.postings.push(Vec::new());
+                self.doc_freqs.push(0);
+            }
+            for (term_id, gpu_plist) in result.postings.into_iter().enumerate() {
+                if !gpu_plist.is_empty() {
+                    let count = gpu_plist.len() as u32;
+                    self.postings[term_id].extend_from_slice(&gpu_plist);
+                    self.doc_freqs[term_id] += count;
+                }
+            }
+            if result.vocab.len() > self.vocab.len() {
+                self.vocab = result.vocab;
+            }
+        }
+
+        self.doc_lengths.extend_from_slice(&result.doc_lengths);
+        self.total_tokens += result.total_tokens;
+        self.num_docs = base_id + num_new_docs as u32;
+
+        let ids: Vec<usize> = (base_id as usize..base_id as usize + num_new_docs).collect();
         self.auto_save()?;
         Ok(ids)
     }
@@ -690,6 +778,90 @@ impl BM25 {
         self.total_tokens = total_tokens;
         self.num_docs = num_docs;
         self.mmap_data = Some(mmap_data);
+    }
+
+    /// Create a GPU search index for fast search. Call once after indexing.
+    #[cfg(feature = "cuda")]
+    pub fn to_gpu_search_index(&self) -> Result<crate::cuda::GpuSearchIndex, String> {
+        let ctx =
+            crate::cuda::get_global_context().ok_or_else(|| "CUDA not available".to_string())?;
+
+        // If mmap-backed, need to materialize posting lists
+        let postings_ref: Vec<Vec<(u32, u32)>>;
+        let postings = if let Some(ref mmap) = self.mmap_data {
+            postings_ref = (0..self.vocab.len() as u32)
+                .map(|t| {
+                    let mut entries = Vec::new();
+                    mmap.for_each_posting(t, &mut |doc_id, tf| entries.push((doc_id, tf)));
+                    entries
+                })
+                .collect();
+            &postings_ref
+        } else {
+            &self.postings
+        };
+
+        let doc_lengths = if let Some(ref mmap) = self.mmap_data {
+            mmap.all_doc_lengths()
+        } else {
+            self.doc_lengths.clone()
+        };
+
+        crate::cuda::GpuSearchIndex::from_index(&ctx, postings, &doc_lengths, self.num_docs)
+    }
+
+    /// Search using GPU-resident index. Much faster than CPU search for large indices.
+    #[cfg(feature = "cuda")]
+    pub fn search_gpu(
+        &self,
+        gpu_index: &mut crate::cuda::GpuSearchIndex,
+        query: &str,
+        k: usize,
+    ) -> Vec<SearchResult> {
+        if self.num_docs == 0 {
+            return Vec::new();
+        }
+
+        let ctx = match crate::cuda::get_global_context() {
+            Some(c) => c,
+            None => return self.search(query, k),
+        };
+
+        let query_tokens = self.tokenizer.tokenize_owned(query);
+        let params = ScoringParams {
+            k1: self.k1,
+            b: self.b,
+            delta: self.delta,
+            avgdl: self.total_tokens as f32 / self.num_docs as f32,
+        };
+
+        // Build (term_id, idf) pairs for query
+        let mut seen = std::collections::HashSet::new();
+        let mut query_terms: Vec<(u32, f32)> = Vec::new();
+        for token in &query_tokens {
+            if let Some(&term_id) = self.vocab.get(token.as_str()) {
+                if seen.insert(term_id) {
+                    let df = self.doc_freqs.get(term_id as usize).copied().unwrap_or(0);
+                    if df > 0 {
+                        query_terms.push((term_id, scoring::idf(self.method, self.num_docs, df)));
+                    }
+                }
+            }
+        }
+
+        match gpu_index.search(&ctx, &query_terms, params.k1, params.b, params.avgdl, k) {
+            Ok(results) => results
+                .into_iter()
+                .map(|(doc_id, score)| SearchResult {
+                    index: doc_id as usize,
+                    score,
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!("[bm25x] GPU search failed: {}, falling back to CPU", e);
+                self.search(query, k)
+            }
+        }
     }
 }
 

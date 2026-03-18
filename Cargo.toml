@@ -18,6 +18,12 @@ serde = { version = "1", features = ["derive"] }
 rust-stemmers = "1.2"
 unicode-normalization = "0.1"
 rayon = "1.10"
+rustc-hash = "2"
+cudarc = { version = "0.19", default-features = false, features = ["cuda-version-from-build-system", "driver", "dynamic-loading", "nvrtc"], optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
 
 [dev-dependencies]
 tempfile = "3"

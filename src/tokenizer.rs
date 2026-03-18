@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use rust_stemmers::{Algorithm, Stemmer};
+use rustc_hash::FxHashMap;
 use unicode_normalization::UnicodeNormalization;
 
 /// Tokenizer mode controls text preprocessing.
@@ -212,6 +215,205 @@ impl Tokenizer {
             }
         }
         tokens
+    }
+
+    /// Tokenize with a thread-local stem cache for amortized O(1) stemming.
+    ///
+    /// The cache maps pre-stem tokens → stemmed form. For large corpora this
+    /// avoids redundant Snowball stemming of repeated words across documents.
+    /// ~500K unique English tokens means ~500K stems cached, vs ~500M stem calls.
+    /// Tokenize with std HashMap stem cache (for non-CUDA paths).
+    pub fn tokenize_cached(
+        &self,
+        text: &str,
+        stem_cache: &mut HashMap<String, String>,
+    ) -> Vec<String> {
+        self.tokenize_with_cache_impl(text, stem_cache)
+    }
+
+    /// Tokenize with FxHashMap stem cache (faster hashing, used by CUDA path).
+    pub fn tokenize_cached_fx(
+        &self,
+        text: &str,
+        stem_cache: &mut FxHashMap<String, String>,
+    ) -> Vec<String> {
+        self.tokenize_with_cache_impl(text, stem_cache)
+    }
+
+    fn tokenize_with_cache_impl<S: std::hash::BuildHasher>(
+        &self,
+        text: &str,
+        stem_cache: &mut HashMap<String, String, S>,
+    ) -> Vec<String> {
+        let lowered = text.to_lowercase();
+
+        let normalized: String = match self.mode {
+            TokenizerMode::Unicode | TokenizerMode::UnicodeStem => fold_to_ascii(&lowered),
+            _ => lowered,
+        };
+
+        let raw_tokens = split_alphanumeric(&normalized);
+
+        let mut tokens = Vec::with_capacity(raw_tokens.len());
+        for token in raw_tokens {
+            if !self.should_keep(&token) {
+                continue;
+            }
+            let final_token = if let Some(ref stemmer) = self.stemmer {
+                if let Some(cached) = stem_cache.get(&token) {
+                    cached.clone()
+                } else {
+                    let stemmed = stemmer.stem(&token).into_owned();
+                    stem_cache.insert(token, stemmed.clone());
+                    stemmed
+                }
+            } else {
+                token
+            };
+            if !final_token.is_empty() {
+                tokens.push(final_token);
+            }
+        }
+        tokens
+    }
+
+    /// Fused tokenize + TF count: single-pass ASCII fast path, zero intermediate allocations.
+    ///
+    /// For ASCII text (99%+ of English corpora), this:
+    /// - Does in-place lowercase in a reusable buffer (no String alloc)
+    /// - Skips fold_to_ascii entirely (text is already ASCII)
+    /// - Splits + stopword-filters + stem-caches + TF-counts in ONE pass
+    /// - Avoids allocating Vec<String> for intermediate tokens
+    ///
+    /// For non-ASCII text, falls back to the standard 3-pass pipeline.
+    pub fn tokenize_and_count<S: std::hash::BuildHasher>(
+        &self,
+        text: &str,
+        stem_cache: &mut HashMap<String, String, S>,
+        tf_map: &mut HashMap<String, u32, S>,
+        buf: &mut Vec<u8>,
+    ) -> u32 {
+        tf_map.clear();
+
+        if text.is_ascii() {
+            self.tokenize_count_ascii(text, stem_cache, tf_map, buf)
+        } else {
+            self.tokenize_count_unicode(text, stem_cache, tf_map)
+        }
+    }
+
+    /// ASCII fast path: zero-heap-alloc single-pass tokenization.
+    ///
+    /// Lowercases on-the-fly into a stack-allocated 128-byte token buffer.
+    /// Never touches the heap for text processing — only for stem cache
+    /// misses and new TF map entries.
+    fn tokenize_count_ascii<S: std::hash::BuildHasher>(
+        &self,
+        text: &str,
+        stem_cache: &mut HashMap<String, String, S>,
+        tf_map: &mut HashMap<String, u32, S>,
+        _buf: &mut Vec<u8>,
+    ) -> u32 {
+        let bytes = text.as_bytes();
+        let mut doc_len = 0u32;
+        // Stack-allocated token buffer — no heap allocation per token.
+        // 128 bytes covers all English words (longest common word ~30 chars).
+        let mut token_buf: [u8; 128] = [0; 128];
+        let mut token_len: usize = 0;
+
+        for &b in bytes {
+            if b.is_ascii_alphanumeric() {
+                if token_len < 128 {
+                    // Branchless ASCII lowercase: 'A'-'Z' → 'a'-'z', others unchanged.
+                    // b | 0x20 works for letters but corrupts digits, so use conditional.
+                    token_buf[token_len] = b.to_ascii_lowercase();
+                    token_len += 1;
+                }
+                // Tokens > 128 chars: silently truncate (never happens in practice)
+            } else if token_len > 0 {
+                let token = unsafe { std::str::from_utf8_unchecked(&token_buf[..token_len]) };
+                doc_len += self.count_token(token, stem_cache, tf_map);
+                token_len = 0;
+            }
+        }
+        // Handle last token (no trailing separator)
+        if token_len > 0 {
+            let token = unsafe { std::str::from_utf8_unchecked(&token_buf[..token_len]) };
+            doc_len += self.count_token(token, stem_cache, tf_map);
+        }
+        doc_len
+    }
+
+    /// Unicode fallback: standard 3-pass pipeline fused with TF counting.
+    fn tokenize_count_unicode<S: std::hash::BuildHasher>(
+        &self,
+        text: &str,
+        stem_cache: &mut HashMap<String, String, S>,
+        tf_map: &mut HashMap<String, u32, S>,
+    ) -> u32 {
+        let lowered = text.to_lowercase();
+        let normalized: String = match self.mode {
+            TokenizerMode::Unicode | TokenizerMode::UnicodeStem => fold_to_ascii(&lowered),
+            _ => lowered,
+        };
+        // After fold_to_ascii, result is ASCII — use the fast split+count loop
+        let bytes = normalized.as_bytes();
+        let mut doc_len = 0u32;
+        let mut start: Option<usize> = None;
+
+        for i in 0..bytes.len() {
+            if bytes[i].is_ascii_alphanumeric() {
+                if start.is_none() {
+                    start = Some(i);
+                }
+            } else if let Some(s) = start {
+                doc_len += self.count_token(&normalized[s..i], stem_cache, tf_map);
+                start = None;
+            }
+        }
+        if let Some(s) = start {
+            doc_len += self.count_token(&normalized[s..], stem_cache, tf_map);
+        }
+        doc_len
+    }
+
+    /// Process a single token: stopword check → stem cache → TF map increment.
+    /// Returns 1 if token was counted, 0 if filtered.
+    #[inline]
+    fn count_token<S: std::hash::BuildHasher>(
+        &self,
+        token: &str,
+        stem_cache: &mut HashMap<String, String, S>,
+        tf_map: &mut HashMap<String, u32, S>,
+    ) -> u32 {
+        if !self.should_keep(token) {
+            return 0;
+        }
+
+        if let Some(ref stemmer) = self.stemmer {
+            if let Some(stem) = stem_cache.get(token) {
+                // Hot path: stem cached. Try TF map lookup first to avoid clone.
+                if let Some(count) = tf_map.get_mut(stem.as_str()) {
+                    *count += 1;
+                } else {
+                    tf_map.insert(stem.clone(), 1);
+                }
+            } else {
+                // Cold path: new token, compute stem
+                let stemmed = stemmer.stem(token).into_owned();
+                if !stemmed.is_empty() {
+                    stem_cache.insert(token.to_string(), stemmed.clone());
+                    *tf_map.entry(stemmed).or_insert(0) += 1;
+                } else {
+                    return 0;
+                }
+            }
+        } else if let Some(count) = tf_map.get_mut(token) {
+            *count += 1;
+        } else {
+            tf_map.insert(token.to_string(), 1);
+        }
+        1
     }
 
     #[inline]
