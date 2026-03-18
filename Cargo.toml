@@ -1,12 +1,12 @@
 [package]
 name = "bm25x"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "A fast, streaming-friendly BM25 search engine with mmap support"
 license = "MIT"
 repository = "https://github.com/lightonai/bm25x"
 homepage = "https://github.com/lightonai/bm25x"
-keywords = ["bm25", "search", "information-retrieval", "mmap", "streaming"]
+keywords = ["bm25", "search", "retrieval", "mmap", "streaming"]
 categories = ["text-processing", "database"]
 readme = "README.md"
 exclude = ["benchmarks/", "python/", ".github/", ".pre-commit-config.yaml"]
