@@ -43,7 +43,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff isort
+      - run: pip install ruff 'isort>=6,<7'
       - run: ruff check benchmarks/
       - run: isort --check-only benchmarks/
 
@@ -60,12 +60,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Python dependencies
-        run: pip install maturin bm25s ir-measures beir
+      - name: Setup venv and install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin bm25s ir-measures beir
 
       - name: Build bm25x Python bindings
-        working-directory: python
-        run: maturin develop --release
+        run: |
+          source .venv/bin/activate
+          cd python && maturin develop --release
 
       - name: Run BEIR SciFact benchmark
-        run: python benchmarks/beir_scifact.py
+        run: |
+          source .venv/bin/activate
+          python benchmarks/beir_scifact.py
