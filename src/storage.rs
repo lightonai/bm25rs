@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write as IoWrite};
 use std::path::Path;
@@ -154,8 +154,8 @@ impl BM25 {
             magic: MAGIC,
             version: VERSION,
             num_terms: self.get_vocab().len() as u32,
-            next_doc_id: self.get_next_doc_id(),
-            num_docs: self.len() as u32,
+            next_doc_id: self.get_num_docs(),
+            num_docs: self.get_num_docs(),
             total_tokens: self.get_total_tokens(),
             k1_bits: self.k1.to_bits(),
             b_bits: self.b.to_bits(),
@@ -167,7 +167,7 @@ impl BM25 {
 
         if self.get_mmap_data().is_some() {
             // Mmap-backed: the binary files on disk are already up to date.
-            // Only metadata (header, vocab, deleted) needs rewriting — done below.
+            // Only metadata (header, vocab) needs rewriting — done below.
         } else {
             // In-memory path: serialize from Vec data
             write_bytes(
@@ -197,12 +197,9 @@ impl BM25 {
             write_bytes(dir.join("offsets.bin"), as_slice_bytes(&offsets))?;
         }
 
-        // Write vocab and deleted as bincode
+        // Write vocab
         let vocab_bytes = bincode::serialize(self.get_vocab()).map_err(io::Error::other)?;
         fs::write(dir.join("vocab.bin"), &vocab_bytes)?;
-
-        let deleted_bytes = bincode::serialize(self.get_deleted()).map_err(io::Error::other)?;
-        fs::write(dir.join("deleted.bin"), &deleted_bytes)?;
 
         Ok(())
     }
@@ -234,14 +231,10 @@ impl BM25 {
         let b = f32::from_bits(header.b_bits);
         let delta = f32::from_bits(header.delta_bits);
 
-        // Read vocab and deleted
+        // Read vocab
         let vocab_bytes = fs::read(dir.join("vocab.bin"))?;
         let vocab: HashMap<String, u32> =
             bincode::deserialize(&vocab_bytes).map_err(io::Error::other)?;
-
-        let deleted_bytes = fs::read(dir.join("deleted.bin"))?;
-        let deleted: HashSet<u32> =
-            bincode::deserialize(&deleted_bytes).map_err(io::Error::other)?;
 
         let mut index = BM25::new(method, k1, b, delta, true);
 
@@ -262,14 +255,7 @@ impl BM25 {
                 _max_doc_id: header.next_doc_id,
             };
 
-            index.set_mmap_internals(
-                vocab,
-                deleted,
-                header.total_tokens,
-                header.num_docs,
-                header.next_doc_id,
-                mmap_data,
-            );
+            index.set_mmap_internals(vocab, header.total_tokens, header.num_docs, mmap_data);
         } else {
             // Read everything into memory
             let doc_lens_bytes = fs::read(dir.join("doc_lens.bin"))?;
@@ -295,12 +281,10 @@ impl BM25 {
 
             index.set_internals(
                 vocab,
-                deleted,
                 doc_lengths,
                 postings,
                 header.total_tokens,
                 header.num_docs,
-                header.next_doc_id,
             );
         }
 
@@ -441,6 +425,7 @@ mod tests {
     fn test_save_load_with_deletions() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&["hello world", "foo bar", "hello foo"]);
+        // Delete doc 1 ("foo bar") — compacts to ["hello world", "hello foo"]
         index.delete(&[1]);
 
         let dir = TempDir::new().unwrap();
@@ -449,7 +434,9 @@ mod tests {
         let loaded = BM25::load(dir.path(), false).unwrap();
         assert_eq!(loaded.len(), 2);
 
+        // "foo" is now only in doc 1 (was "hello foo" at old index 2)
         let results = loaded.search("foo", 10);
-        assert!(results.iter().all(|r| r.index != 1));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].index, 1);
     }
 }

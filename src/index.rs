@@ -8,7 +8,7 @@ use crate::tokenizer::Tokenizer;
 /// A scored document result.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    /// The document index (0-based, as returned by `add`).
+    /// The document index (0-based, contiguous).
     pub index: usize,
     /// The BM25 score.
     pub score: f32,
@@ -36,6 +36,9 @@ impl Ord for MinScored {
 }
 
 /// The core BM25 index.
+///
+/// Document indices are contiguous 0..n. Deleting a document compacts the index:
+/// all documents after the deleted one shift down by one.
 pub struct BM25 {
     // Scoring parameters
     pub k1: f32,
@@ -43,10 +46,10 @@ pub struct BM25 {
     pub delta: f32,
     pub method: Method,
 
-    // Inverted index: term_id -> Vec<(doc_id, tf)>
+    // Inverted index: term_id -> Vec<(doc_id, tf)> sorted by doc_id
     postings: Vec<Vec<(u32, u32)>>,
 
-    // Cached document frequency per term (avoids counting on every query)
+    // Cached document frequency per term
     doc_freqs: Vec<u32>,
 
     // Document metadata
@@ -54,14 +57,8 @@ pub struct BM25 {
     total_tokens: u64,
     num_docs: u32,
 
-    // Deleted documents (tombstones)
-    deleted: HashSet<u32>,
-
     // Vocabulary: token string -> term_id
     vocab: HashMap<String, u32>,
-
-    // Next document ID to assign
-    next_doc_id: u32,
 
     // Tokenizer
     tokenizer: Tokenizer,
@@ -83,9 +80,7 @@ impl BM25 {
             doc_lengths: Vec::new(),
             total_tokens: 0,
             num_docs: 0,
-            deleted: HashSet::new(),
             vocab: HashMap::new(),
-            next_doc_id: 0,
             tokenizer: Tokenizer::new(use_stopwords),
             mmap_data: None,
         }
@@ -93,7 +88,6 @@ impl BM25 {
 
     /// Add documents to the index. Returns the assigned document indices.
     pub fn add(&mut self, documents: &[&str]) -> Vec<usize> {
-        // Mmap index is read-only for postings; convert to writable if needed
         if self.mmap_data.is_some() {
             self.materialize_mmap();
         }
@@ -101,8 +95,8 @@ impl BM25 {
         let mut ids = Vec::with_capacity(documents.len());
 
         for doc in documents {
-            let doc_id = self.next_doc_id;
-            self.next_doc_id += 1;
+            let doc_id = self.num_docs;
+            self.num_docs += 1;
 
             let tokens = self.tokenizer.tokenize_owned(doc);
             let doc_len = tokens.len() as u32;
@@ -120,13 +114,8 @@ impl BM25 {
                 self.doc_freqs[term_id as usize] += 1;
             }
 
-            // Ensure doc_lengths is large enough
-            if doc_id as usize >= self.doc_lengths.len() {
-                self.doc_lengths.resize(doc_id as usize + 1, 0);
-            }
-            self.doc_lengths[doc_id as usize] = doc_len;
+            self.doc_lengths.push(doc_len);
             self.total_tokens += doc_len as u64;
-            self.num_docs += 1;
 
             ids.push(doc_id as usize);
         }
@@ -147,13 +136,11 @@ impl BM25 {
             delta: self.delta,
             avgdl: self.total_tokens as f32 / self.num_docs as f32,
         };
-        let has_deleted = !self.deleted.is_empty();
 
         // Use a flat score array indexed by doc_id for O(1) accumulation
-        let mut scores = vec![0.0f32; self.next_doc_id as usize];
-        let mut touched = Vec::new(); // track which doc_ids got scores
+        let mut scores = vec![0.0f32; self.num_docs as usize];
+        let mut touched = Vec::new();
 
-        // Deduplicate query tokens to avoid redundant work
         let mut seen_terms: HashSet<u32> = HashSet::new();
 
         for token in &query_tokens {
@@ -165,11 +152,7 @@ impl BM25 {
                 continue;
             }
 
-            let df = if !has_deleted {
-                self.doc_freqs.get(term_id as usize).copied().unwrap_or(0)
-            } else {
-                self.doc_freq_fast(term_id, true)
-            };
+            let df = self.doc_freqs.get(term_id as usize).copied().unwrap_or(0);
             if df == 0 {
                 continue;
             }
@@ -177,9 +160,6 @@ impl BM25 {
             let idf_val = scoring::idf(self.method, self.num_docs, df);
 
             self.for_each_posting(term_id, |doc_id, tf| {
-                if has_deleted && self.deleted.contains(&doc_id) {
-                    return;
-                }
                 let dl = self.get_doc_length(doc_id);
                 let s = scoring::score(self.method, tf, dl, &params, idf_val);
                 let idx = doc_id as usize;
@@ -197,9 +177,8 @@ impl BM25 {
     /// Only documents whose index is in `subset` will be scored.
     /// IDF is computed from global corpus stats so scores stay comparable.
     ///
-    /// Uses a doc-centric approach: iterates allowed IDs and looks up each doc's
-    /// TF via binary search on posting lists. Cost is O(|allowed| * |query_terms| * log(posting_len))
-    /// which is much faster than scanning full posting lists when |allowed| is small.
+    /// Uses a doc-centric approach: iterates subset IDs and looks up each doc's
+    /// TF via binary search on posting lists. Cost is O(|subset| * |query_terms| * log(posting_len)).
     pub fn search_filtered(&self, query: &str, k: usize, subset: &[usize]) -> Vec<SearchResult> {
         if self.num_docs == 0 || subset.is_empty() {
             return Vec::new();
@@ -212,9 +191,7 @@ impl BM25 {
             delta: self.delta,
             avgdl: self.total_tokens as f32 / self.num_docs as f32,
         };
-        let has_deleted = !self.deleted.is_empty();
 
-        // Resolve query tokens to term_ids + IDF values
         let mut query_terms: Vec<(u32, f32)> = Vec::new();
         let mut seen_terms: HashSet<u32> = HashSet::new();
         for token in &query_tokens {
@@ -225,11 +202,7 @@ impl BM25 {
             if !seen_terms.insert(term_id) {
                 continue;
             }
-            let df = if !has_deleted {
-                self.doc_freqs.get(term_id as usize).copied().unwrap_or(0)
-            } else {
-                self.doc_freq_fast(term_id, true)
-            };
+            let df = self.doc_freqs.get(term_id as usize).copied().unwrap_or(0);
             if df == 0 {
                 continue;
             }
@@ -239,15 +212,10 @@ impl BM25 {
             return Vec::new();
         }
 
-        // Doc-centric scoring: for each allowed doc, look up TF via binary search.
-        // Cost: O(|allowed| * |query_terms| * log(posting_len))
         let mut heap = BinaryHeap::with_capacity(k + 1);
         for &doc_idx in subset {
             let doc_id = doc_idx as u32;
-            if doc_id >= self.next_doc_id {
-                continue;
-            }
-            if has_deleted && self.deleted.contains(&doc_id) {
+            if doc_id >= self.num_docs {
                 continue;
             }
             let dl = self.get_doc_length(doc_id);
@@ -299,43 +267,100 @@ impl BM25 {
     }
 
     /// Delete one or more documents by their indices.
+    /// All documents after a deleted index shift down to fill the gap.
+    /// For example: deleting doc 1 from [0,1,2] makes old doc 2 become new doc 1.
     pub fn delete(&mut self, doc_ids: &[usize]) {
-        for &id in doc_ids {
-            let doc_id = id as u32;
-            if doc_id < self.next_doc_id && !self.deleted.contains(&doc_id) {
-                self.deleted.insert(doc_id);
-                let dl = self.get_doc_length(doc_id);
-                self.total_tokens = self.total_tokens.saturating_sub(dl as u64);
-                self.num_docs = self.num_docs.saturating_sub(1);
-                // Note: doc_freqs become stale when there are deletions.
-                // We handle this in search by falling back to counting when deleted is non-empty.
+        if doc_ids.is_empty() {
+            return;
+        }
+        if self.mmap_data.is_some() {
+            self.materialize_mmap();
+        }
+
+        // Sort and deduplicate, filter out-of-range
+        let mut to_delete: Vec<u32> = doc_ids
+            .iter()
+            .map(|&id| id as u32)
+            .filter(|&id| id < self.num_docs)
+            .collect();
+        to_delete.sort_unstable();
+        to_delete.dedup();
+
+        if to_delete.is_empty() {
+            return;
+        }
+
+        // Subtract deleted doc lengths from total_tokens
+        for &id in &to_delete {
+            self.total_tokens -= self.doc_lengths[id as usize] as u64;
+        }
+
+        // Build old_id -> new_id mapping.
+        // Deleted docs map to u32::MAX (sentinel), others shift down.
+        let old_count = self.num_docs as usize;
+        let mut id_map: Vec<u32> = Vec::with_capacity(old_count);
+        let mut del_idx = 0;
+        let mut shift = 0u32;
+        for old_id in 0..old_count as u32 {
+            if del_idx < to_delete.len() && to_delete[del_idx] == old_id {
+                id_map.push(u32::MAX); // sentinel: deleted
+                shift += 1;
+                del_idx += 1;
+            } else {
+                id_map.push(old_id - shift);
             }
         }
+
+        let new_count = self.num_docs - to_delete.len() as u32;
+
+        // Compact doc_lengths
+        let mut new_doc_lengths = Vec::with_capacity(new_count as usize);
+        for (old_id, &dl) in self.doc_lengths.iter().enumerate() {
+            if id_map[old_id] != u32::MAX {
+                new_doc_lengths.push(dl);
+            }
+        }
+        self.doc_lengths = new_doc_lengths;
+
+        // Remap posting lists: remove deleted entries, remap doc_ids
+        for (term_id, plist) in self.postings.iter_mut().enumerate() {
+            let old_len = plist.len();
+            plist.retain(|&(did, _)| id_map[did as usize] != u32::MAX);
+            let removed = old_len - plist.len();
+            if removed > 0 {
+                self.doc_freqs[term_id] -= removed as u32;
+            }
+            for entry in plist.iter_mut() {
+                entry.0 = id_map[entry.0 as usize];
+            }
+        }
+
+        self.num_docs = new_count;
     }
 
-    /// Update a document's text. The document keeps its original index.
+    /// Update a document's text. The document keeps its index.
     pub fn update(&mut self, doc_id: usize, new_text: &str) {
         if self.mmap_data.is_some() {
             self.materialize_mmap();
         }
 
         let id = doc_id as u32;
+        assert!(
+            id < self.num_docs,
+            "doc_id {} out of range (num_docs={})",
+            doc_id,
+            self.num_docs
+        );
 
         // Remove old postings for this doc
-        if !self.deleted.contains(&id) {
-            let old_dl = self.get_doc_length(id);
-            self.total_tokens = self.total_tokens.saturating_sub(old_dl as u64);
-            // Remove from all posting lists, updating doc_freqs
-            for (term_id, postings) in self.postings.iter_mut().enumerate() {
-                let old_len = postings.len();
-                postings.retain(|&(did, _)| did != id);
-                if postings.len() < old_len {
-                    self.doc_freqs[term_id] -= 1;
-                }
+        let old_dl = self.doc_lengths[id as usize];
+        self.total_tokens -= old_dl as u64;
+        for (term_id, postings) in self.postings.iter_mut().enumerate() {
+            let old_len = postings.len();
+            postings.retain(|&(did, _)| did != id);
+            if postings.len() < old_len {
+                self.doc_freqs[term_id] -= 1;
             }
-        } else {
-            // Was deleted, re-adding
-            self.deleted.remove(&id);
         }
 
         // Re-tokenize and re-index
@@ -350,35 +375,16 @@ impl BM25 {
         for (token, tf) in tf_map {
             let term_id = self.get_or_create_term(&token);
             let plist = &mut self.postings[term_id as usize];
-            // Insert sorted to maintain binary-search invariant
             let pos = plist.partition_point(|&(did, _)| did < id);
             plist.insert(pos, (id, tf));
             self.doc_freqs[term_id as usize] += 1;
         }
 
-        if id as usize >= self.doc_lengths.len() {
-            self.doc_lengths.resize(id as usize + 1, 0);
-        }
         self.doc_lengths[id as usize] = doc_len;
         self.total_tokens += doc_len as u64;
-
-        // If it was previously deleted, increment num_docs
-        // (already handled above by removing from deleted set)
-        if !self.deleted.contains(&id) {
-            // Only increment if we removed it from deleted above
-            // We need to check differently: if it was in `deleted` before this call
-            // Actually, we handle this: if deleted contained it, we removed it and
-            // didn't decrement num_docs (it was already decremented in delete()).
-            // So we need to re-increment.
-        }
-        // Simpler: just recount. For correctness, let's recalculate.
-        // Actually the logic is: the doc existed before and was not deleted (we subtracted its length),
-        // or it was deleted (we removed from deleted set). Either way, after update, it should be active.
-        // num_docs should reflect active docs. Let's just recalculate from state.
-        self.num_docs = self.next_doc_id - self.deleted.len() as u32;
     }
 
-    /// Get the number of active (non-deleted) documents.
+    /// Get the number of documents.
     pub fn len(&self) -> usize {
         self.num_docs as usize
     }
@@ -402,28 +408,6 @@ impl BM25 {
         }
     }
 
-    /// Get document frequency for a term, with pre-computed has_deleted flag.
-    #[inline]
-    fn doc_freq_fast(&self, term_id: u32, has_deleted: bool) -> u32 {
-        if !has_deleted {
-            // No deletions: df = posting list length
-            if let Some(ref mmap) = self.mmap_data {
-                return mmap.posting_count(term_id);
-            }
-            return self
-                .postings
-                .get(term_id as usize)
-                .map_or(0, |p| p.len() as u32);
-        }
-        let mut count = 0u32;
-        self.for_each_posting(term_id, |doc_id, _| {
-            if !self.deleted.contains(&doc_id) {
-                count += 1;
-            }
-        });
-        count
-    }
-
     /// Get document length for a doc_id.
     fn get_doc_length(&self, doc_id: u32) -> u32 {
         if let Some(ref mmap) = self.mmap_data {
@@ -433,7 +417,7 @@ impl BM25 {
         }
     }
 
-    /// Iterate over postings for a term, calling `f(doc_id, tf)` for each entry.
+    /// Iterate over postings for a term.
     fn for_each_posting<F: FnMut(u32, u32)>(&self, term_id: u32, mut f: F) {
         if let Some(ref mmap) = self.mmap_data {
             mmap.for_each_posting(term_id, &mut f);
@@ -444,8 +428,7 @@ impl BM25 {
         }
     }
 
-    /// Look up term frequency for a specific (term_id, doc_id) pair.
-    /// Uses binary search on posting lists (which are sorted by doc_id).
+    /// Look up term frequency for a specific (term_id, doc_id) via binary search.
     #[inline]
     fn get_tf(&self, term_id: u32, doc_id: u32) -> Option<u32> {
         if let Some(ref mmap) = self.mmap_data {
@@ -473,7 +456,6 @@ impl BM25 {
                 self.postings.push(entries);
             }
             self.doc_lengths = mmap.all_doc_lengths();
-            // doc_freqs already populated from set_mmap_internals
         }
     }
 
@@ -495,55 +477,43 @@ impl BM25 {
         &self.vocab
     }
 
-    pub(crate) fn get_deleted(&self) -> &HashSet<u32> {
-        &self.deleted
-    }
-
     pub(crate) fn get_total_tokens(&self) -> u64 {
         self.total_tokens
     }
 
-    pub(crate) fn get_next_doc_id(&self) -> u32 {
-        self.next_doc_id
+    pub(crate) fn get_num_docs(&self) -> u32 {
+        self.num_docs
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_internals(
         &mut self,
         vocab: HashMap<String, u32>,
-        deleted: HashSet<u32>,
         doc_lengths: Vec<u32>,
         postings: Vec<Vec<(u32, u32)>>,
         total_tokens: u64,
         num_docs: u32,
-        next_doc_id: u32,
     ) {
         self.doc_freqs = postings.iter().map(|p| p.len() as u32).collect();
         self.vocab = vocab;
-        self.deleted = deleted;
         self.doc_lengths = doc_lengths;
         self.postings = postings;
         self.total_tokens = total_tokens;
         self.num_docs = num_docs;
-        self.next_doc_id = next_doc_id;
     }
 
     pub(crate) fn set_mmap_internals(
         &mut self,
         vocab: HashMap<String, u32>,
-        deleted: HashSet<u32>,
         total_tokens: u64,
         num_docs: u32,
-        next_doc_id: u32,
         mmap_data: MmapData,
     ) {
         let num_terms = vocab.len() as u32;
         self.doc_freqs = (0..num_terms).map(|t| mmap_data.posting_count(t)).collect();
         self.vocab = vocab;
-        self.deleted = deleted;
         self.total_tokens = total_tokens;
         self.num_docs = num_docs;
-        self.next_doc_id = next_doc_id;
         self.mmap_data = Some(mmap_data);
     }
 }
@@ -571,22 +541,59 @@ mod tests {
 
         let results = index.search("quick fox", 10);
         assert!(!results.is_empty());
-        // Doc 0 and 2 mention both "quick" and "fox"
         assert!(results[0].index == 0 || results[0].index == 2);
     }
 
     #[test]
-    fn test_delete() {
+    fn test_delete_compacts() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&["hello world", "foo bar", "hello foo"]);
         assert_eq!(index.len(), 3);
 
+        // Delete doc 0 ("hello world")
         index.delete(&[0]);
         assert_eq!(index.len(), 2);
 
-        let results = index.search("hello", 10);
-        // Should only find doc 2, not doc 0
-        assert!(results.iter().all(|r| r.index != 0));
+        // Old doc 1 ("foo bar") is now doc 0
+        // Old doc 2 ("hello foo") is now doc 1
+        let results = index.search("foo", 10);
+        assert_eq!(results.len(), 2);
+        let ids: Vec<usize> = results.iter().map(|r| r.index).collect();
+        assert!(ids.contains(&0)); // was "foo bar"
+        assert!(ids.contains(&1)); // was "hello foo"
+    }
+
+    #[test]
+    fn test_delete_middle() {
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        index.add(&["alpha", "beta", "gamma", "delta"]);
+
+        // Delete doc 1 ("beta"): [alpha, gamma, delta]
+        index.delete(&[1]);
+        assert_eq!(index.len(), 3);
+
+        let results = index.search("gamma", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].index, 1); // gamma shifted from 2 to 1
+
+        let results = index.search("delta", 10);
+        assert_eq!(results[0].index, 2); // delta shifted from 3 to 2
+    }
+
+    #[test]
+    fn test_delete_multiple() {
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        index.add(&["a", "b", "c", "d", "e"]);
+
+        // Delete docs 1 and 3: [a, c, e]
+        index.delete(&[1, 3]);
+        assert_eq!(index.len(), 3);
+
+        let results = index.search("c", 10);
+        assert_eq!(results[0].index, 1); // c shifted from 2 to 1
+
+        let results = index.search("e", 10);
+        assert_eq!(results[0].index, 2); // e shifted from 4 to 2
     }
 
     #[test]
@@ -594,7 +601,6 @@ mod tests {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&["hello world", "foo bar"]);
 
-        // Update doc 0 to no longer contain "hello"
         index.update(0, "goodbye universe");
 
         let results = index.search("hello", 10);
@@ -635,7 +641,6 @@ mod tests {
             Method::BM25Plus,
         ] {
             let mut index = BM25::new(method, 1.5, 0.75, 0.5, false);
-            // Use enough docs so Robertson IDF doesn't clamp all terms to 0
             index.add(&[
                 "the cat sat on the mat",
                 "the dog played in the park",
@@ -658,11 +663,9 @@ mod tests {
             "the slow brown truck", // 3
         ]);
 
-        // Unfiltered: "brown" matches 0, 1, 3
         let results = index.search("brown", 10);
         assert_eq!(results.len(), 3);
 
-        // Filtered to only {1, 3}: should only return those two
         let results = index.search_filtered("brown", 10, &[1, 3]);
         assert_eq!(results.len(), 2);
         let ids: Vec<usize> = results.iter().map(|r| r.index).collect();
@@ -682,10 +685,8 @@ mod tests {
             "apple jackfruit kiwi",  // 4
         ]);
 
-        // All 5 match "apple", filter to {0,1,2,3}, ask for k=2
         let results = index.search_filtered("apple", 2, &[0, 1, 2, 3]);
         assert_eq!(results.len(), 2);
-        // All filtered docs should be in {0,1,2,3}
         for r in &results {
             assert!(r.index <= 3);
         }
@@ -708,25 +709,8 @@ mod tests {
             "the lazy dog",        // 1
         ]);
 
-        // "fox" only in doc 0, but filter only allows doc 1
         let results = index.search_filtered("fox", 10, &[1]);
         assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_search_filtered_with_deletions() {
-        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&[
-            "alpha beta gamma", // 0
-            "alpha delta",      // 1
-            "alpha epsilon",    // 2
-        ]);
-        index.delete(&[1]);
-
-        // Filter includes deleted doc 1 — it should still be excluded
-        let results = index.search_filtered("alpha", 10, &[0, 1, 2]);
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.index != 1));
     }
 
     #[test]
@@ -738,8 +722,6 @@ mod tests {
             "rust and python together", // 2
         ]);
 
-        // Score for doc 0 should be the same whether we filter or not
-        // (IDF uses global stats in both cases)
         let unfiltered = index.search("rust", 10);
         let filtered = index.search_filtered("rust", 10, &[0]);
 
@@ -751,5 +733,20 @@ mod tests {
             score_unfiltered,
             score_filtered
         );
+    }
+
+    #[test]
+    fn test_delete_then_add() {
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        index.add(&["alpha", "beta", "gamma"]);
+        index.delete(&[1]); // remove "beta", now [alpha, gamma]
+        assert_eq!(index.len(), 2);
+
+        let ids = index.add(&["delta"]);
+        assert_eq!(ids, vec![2]); // appended at end
+        assert_eq!(index.len(), 3);
+
+        let results = index.search("delta", 10);
+        assert_eq!(results[0].index, 2);
     }
 }
