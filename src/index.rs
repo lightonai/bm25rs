@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::scoring::{self, Method, ScoringParams};
 use crate::storage::MmapData;
@@ -65,6 +67,9 @@ pub struct BM25 {
 
     // Mmap backing (if loaded from disk)
     mmap_data: Option<MmapData>,
+
+    // Auto-save path (if set, mutations persist to disk automatically)
+    index_path: Option<PathBuf>,
 }
 
 impl BM25 {
@@ -83,11 +88,45 @@ impl BM25 {
             vocab: HashMap::new(),
             tokenizer: Tokenizer::new(use_stopwords),
             mmap_data: None,
+            index_path: None,
         }
     }
 
+    /// Open a persistent index at the given path.
+    ///
+    /// - If the directory already contains a saved index, it is loaded (mmap).
+    /// - Every mutation (`add`, `delete`, `update`) auto-saves to disk.
+    /// - If the directory doesn't exist yet, a new empty index is created.
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        method: Method,
+        k1: f32,
+        b: f32,
+        delta: f32,
+        use_stopwords: bool,
+    ) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if path.join("header.bin").exists() {
+            let mut index = Self::load(&path, true)?;
+            index.index_path = Some(path);
+            Ok(index)
+        } else {
+            let mut index = Self::new(method, k1, b, delta, use_stopwords);
+            index.index_path = Some(path);
+            Ok(index)
+        }
+    }
+
+    /// Auto-save to disk if an index path is configured.
+    fn auto_save(&self) -> io::Result<()> {
+        if let Some(ref path) = self.index_path {
+            self.save(path)?;
+        }
+        Ok(())
+    }
+
     /// Add documents to the index. Returns the assigned document indices.
-    pub fn add(&mut self, documents: &[&str]) -> Vec<usize> {
+    pub fn add(&mut self, documents: &[&str]) -> io::Result<Vec<usize>> {
         if self.mmap_data.is_some() {
             self.materialize_mmap();
         }
@@ -101,13 +140,11 @@ impl BM25 {
             let tokens = self.tokenizer.tokenize_owned(doc);
             let doc_len = tokens.len() as u32;
 
-            // Count term frequencies
             let mut tf_map: HashMap<String, u32> = HashMap::new();
             for token in &tokens {
                 *tf_map.entry(token.clone()).or_insert(0) += 1;
             }
 
-            // Update inverted index and doc_freqs
             for (token, tf) in tf_map {
                 let term_id = self.get_or_create_term(&token);
                 self.postings[term_id as usize].push((doc_id, tf));
@@ -120,7 +157,8 @@ impl BM25 {
             ids.push(doc_id as usize);
         }
 
-        ids
+        self.auto_save()?;
+        Ok(ids)
     }
 
     /// Search the index and return top-k results sorted by descending score.
@@ -269,9 +307,9 @@ impl BM25 {
     /// Delete one or more documents by their indices.
     /// All documents after a deleted index shift down to fill the gap.
     /// For example: deleting doc 1 from [0,1,2] makes old doc 2 become new doc 1.
-    pub fn delete(&mut self, doc_ids: &[usize]) {
+    pub fn delete(&mut self, doc_ids: &[usize]) -> io::Result<()> {
         if doc_ids.is_empty() {
-            return;
+            return Ok(());
         }
         if self.mmap_data.is_some() {
             self.materialize_mmap();
@@ -287,7 +325,7 @@ impl BM25 {
         to_delete.dedup();
 
         if to_delete.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Subtract deleted doc lengths from total_tokens
@@ -336,10 +374,11 @@ impl BM25 {
         }
 
         self.num_docs = new_count;
+        self.auto_save()
     }
 
     /// Update a document's text. The document keeps its index.
-    pub fn update(&mut self, doc_id: usize, new_text: &str) {
+    pub fn update(&mut self, doc_id: usize, new_text: &str) -> io::Result<()> {
         if self.mmap_data.is_some() {
             self.materialize_mmap();
         }
@@ -382,6 +421,7 @@ impl BM25 {
 
         self.doc_lengths[id as usize] = doc_len;
         self.total_tokens += doc_len as u64;
+        self.auto_save()
     }
 
     /// Get the number of documents.
@@ -531,11 +571,13 @@ mod tests {
     #[test]
     fn test_add_and_search() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        let ids = index.add(&[
-            "the quick brown fox jumps over the lazy dog",
-            "a fast brown car drives over the bridge",
-            "the fox is quick and clever",
-        ]);
+        let ids = index
+            .add(&[
+                "the quick brown fox jumps over the lazy dog",
+                "a fast brown car drives over the bridge",
+                "the fox is quick and clever",
+            ])
+            .unwrap();
         assert_eq!(ids, vec![0, 1, 2]);
         assert_eq!(index.len(), 3);
 
@@ -547,11 +589,11 @@ mod tests {
     #[test]
     fn test_delete_compacts() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&["hello world", "foo bar", "hello foo"]);
+        index.add(&["hello world", "foo bar", "hello foo"]).unwrap();
         assert_eq!(index.len(), 3);
 
         // Delete doc 0 ("hello world")
-        index.delete(&[0]);
+        index.delete(&[0]).unwrap();
         assert_eq!(index.len(), 2);
 
         // Old doc 1 ("foo bar") is now doc 0
@@ -566,10 +608,10 @@ mod tests {
     #[test]
     fn test_delete_middle() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&["alpha", "beta", "gamma", "delta"]);
+        index.add(&["alpha", "beta", "gamma", "delta"]).unwrap();
 
         // Delete doc 1 ("beta"): [alpha, gamma, delta]
-        index.delete(&[1]);
+        index.delete(&[1]).unwrap();
         assert_eq!(index.len(), 3);
 
         let results = index.search("gamma", 10);
@@ -583,10 +625,10 @@ mod tests {
     #[test]
     fn test_delete_multiple() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&["a", "b", "c", "d", "e"]);
+        index.add(&["a", "b", "c", "d", "e"]).unwrap();
 
         // Delete docs 1 and 3: [a, c, e]
-        index.delete(&[1, 3]);
+        index.delete(&[1, 3]).unwrap();
         assert_eq!(index.len(), 3);
 
         let results = index.search("c", 10);
@@ -599,9 +641,9 @@ mod tests {
     #[test]
     fn test_update() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&["hello world", "foo bar"]);
+        index.add(&["hello world", "foo bar"]).unwrap();
 
-        index.update(0, "goodbye universe");
+        index.update(0, "goodbye universe").unwrap();
 
         let results = index.search("hello", 10);
         assert!(results.is_empty() || results.iter().all(|r| r.index != 0));
@@ -621,8 +663,8 @@ mod tests {
     #[test]
     fn test_streaming_add() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        let ids1 = index.add(&["first document"]);
-        let ids2 = index.add(&["second document"]);
+        let ids1 = index.add(&["first document"]).unwrap();
+        let ids2 = index.add(&["second document"]).unwrap();
         assert_eq!(ids1, vec![0]);
         assert_eq!(ids2, vec![1]);
         assert_eq!(index.len(), 2);
@@ -641,12 +683,14 @@ mod tests {
             Method::BM25Plus,
         ] {
             let mut index = BM25::new(method, 1.5, 0.75, 0.5, false);
-            index.add(&[
-                "the cat sat on the mat",
-                "the dog played in the park",
-                "birds fly over the river",
-                "fish swim in the ocean",
-            ]);
+            index
+                .add(&[
+                    "the cat sat on the mat",
+                    "the dog played in the park",
+                    "birds fly over the river",
+                    "fish swim in the ocean",
+                ])
+                .unwrap();
             let results = index.search("cat mat", 10);
             assert!(!results.is_empty(), "{:?} returned no results", method);
             assert_eq!(results[0].index, 0, "{:?} ranked wrong doc first", method);
@@ -656,12 +700,14 @@ mod tests {
     #[test]
     fn test_search_filtered_basic() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&[
-            "the quick brown fox",  // 0
-            "the lazy brown dog",   // 1
-            "the quick red car",    // 2
-            "the slow brown truck", // 3
-        ]);
+        index
+            .add(&[
+                "the quick brown fox",  // 0
+                "the lazy brown dog",   // 1
+                "the quick red car",    // 2
+                "the slow brown truck", // 3
+            ])
+            .unwrap();
 
         let results = index.search("brown", 10);
         assert_eq!(results.len(), 3);
@@ -677,13 +723,15 @@ mod tests {
     #[test]
     fn test_search_filtered_respects_k() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&[
-            "apple banana cherry",   // 0
-            "apple date elderberry", // 1
-            "apple fig grape",       // 2
-            "apple hazelnut ice",    // 3
-            "apple jackfruit kiwi",  // 4
-        ]);
+        index
+            .add(&[
+                "apple banana cherry",   // 0
+                "apple date elderberry", // 1
+                "apple fig grape",       // 2
+                "apple hazelnut ice",    // 3
+                "apple jackfruit kiwi",  // 4
+            ])
+            .unwrap();
 
         let results = index.search_filtered("apple", 2, &[0, 1, 2, 3]);
         assert_eq!(results.len(), 2);
@@ -695,7 +743,7 @@ mod tests {
     #[test]
     fn test_search_filtered_empty_filter() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&["hello world", "foo bar"]);
+        index.add(&["hello world", "foo bar"]).unwrap();
 
         let results = index.search_filtered("hello", 10, &[]);
         assert!(results.is_empty());
@@ -704,10 +752,12 @@ mod tests {
     #[test]
     fn test_search_filtered_no_overlap() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&[
-            "the quick brown fox", // 0
-            "the lazy dog",        // 1
-        ]);
+        index
+            .add(&[
+                "the quick brown fox", // 0
+                "the lazy dog",        // 1
+            ])
+            .unwrap();
 
         let results = index.search_filtered("fox", 10, &[1]);
         assert!(results.is_empty());
@@ -716,11 +766,13 @@ mod tests {
     #[test]
     fn test_search_filtered_scores_match_unfiltered() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&[
-            "rust is fast and safe",    // 0
-            "python is slow but easy",  // 1
-            "rust and python together", // 2
-        ]);
+        index
+            .add(&[
+                "rust is fast and safe",    // 0
+                "python is slow but easy",  // 1
+                "rust and python together", // 2
+            ])
+            .unwrap();
 
         let unfiltered = index.search("rust", 10);
         let filtered = index.search_filtered("rust", 10, &[0]);
@@ -738,11 +790,11 @@ mod tests {
     #[test]
     fn test_delete_then_add() {
         let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
-        index.add(&["alpha", "beta", "gamma"]);
-        index.delete(&[1]); // remove "beta", now [alpha, gamma]
+        index.add(&["alpha", "beta", "gamma"]).unwrap();
+        index.delete(&[1]).unwrap(); // remove "beta", now [alpha, gamma]
         assert_eq!(index.len(), 2);
 
-        let ids = index.add(&["delta"]);
+        let ids = index.add(&["delta"]).unwrap();
         assert_eq!(ids, vec![2]); // appended at end
         assert_eq!(index.len(), 3);
 
