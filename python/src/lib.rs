@@ -88,6 +88,33 @@ impl PyBM25 {
         Ok(PyBM25 { inner })
     }
 
+    /// Score a query against a list of documents.
+    /// Returns a list of BM25 scores (one per document).
+    /// If `query` is a list of strings, `documents` must be a list of lists,
+    /// and returns a list of lists of scores.
+    fn score(&self, query: &Bound<'_, PyAny>, documents: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let py = query.py();
+        if let Ok(q) = query.extract::<String>() {
+            // Single query, single doc list
+            let docs: Vec<String> = documents.extract()?;
+            let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+            let scores = self.inner.score(&q, &refs);
+            Ok(scores.into_pyobject(py)?.into_any().unbind())
+        } else {
+            // Batch: list of queries, list of doc lists
+            let queries: Vec<String> = query.extract()?;
+            let doc_lists: Vec<Vec<String>> = documents.extract()?;
+            let q_refs: Vec<&str> = queries.iter().map(|s| s.as_str()).collect();
+            let d_refs: Vec<Vec<&str>> = doc_lists
+                .iter()
+                .map(|dl| dl.iter().map(|s| s.as_str()).collect())
+                .collect();
+            let d_slices: Vec<&[&str]> = d_refs.iter().map(|v| v.as_slice()).collect();
+            let results = self.inner.score_batch(&q_refs, &d_slices);
+            Ok(results.into_pyobject(py)?.into_any().unbind())
+        }
+    }
+
     /// Number of active documents.
     fn __len__(&self) -> usize {
         self.inner.len()

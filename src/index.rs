@@ -434,6 +434,84 @@ impl BM25 {
         self.num_docs == 0
     }
 
+    /// Score a query against a list of documents.
+    /// Returns one score per document using the same tokenizer and BM25 parameters.
+    /// The documents are treated as the corpus for IDF computation.
+    pub fn score(&self, query: &str, documents: &[&str]) -> Vec<f32> {
+        let n = documents.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Tokenize documents, compute TFs and doc lengths
+        let mut doc_tokens: Vec<HashMap<String, u32>> = Vec::with_capacity(n);
+        let mut doc_lens: Vec<u32> = Vec::with_capacity(n);
+        let mut total_tokens = 0u64;
+        for doc in documents {
+            let tokens = self.tokenizer.tokenize_owned(doc);
+            let dl = tokens.len() as u32;
+            let mut tf_map: HashMap<String, u32> = HashMap::new();
+            for t in tokens {
+                *tf_map.entry(t).or_insert(0) += 1;
+            }
+            doc_tokens.push(tf_map);
+            doc_lens.push(dl);
+            total_tokens += dl as u64;
+        }
+        let avgdl = total_tokens as f32 / n as f32;
+
+        // Compute DF per term (across the provided documents)
+        let mut df_map: HashMap<&str, u32> = HashMap::new();
+        for tf_map in &doc_tokens {
+            for term in tf_map.keys() {
+                *df_map.entry(term.as_str()).or_insert(0) += 1;
+            }
+        }
+
+        // Tokenize query
+        let query_tokens = self.tokenizer.tokenize_owned(query);
+        let mut seen: HashSet<&str> = HashSet::new();
+        let query_terms: Vec<&str> = query_tokens
+            .iter()
+            .filter(|t| seen.insert(t.as_str()))
+            .map(|t| t.as_str())
+            .collect();
+
+        let params = ScoringParams {
+            k1: self.k1,
+            b: self.b,
+            delta: self.delta,
+            avgdl,
+        };
+
+        // Score each document
+        let n_u32 = n as u32;
+        let mut scores = Vec::with_capacity(n);
+        for (i, tf_map) in doc_tokens.iter().enumerate() {
+            let dl = doc_lens[i];
+            let mut total = 0.0f32;
+            for &qt in &query_terms {
+                if let Some(&tf) = tf_map.get(qt) {
+                    let df = *df_map.get(qt).unwrap_or(&0);
+                    let idf_val = scoring::idf(self.method, n_u32, df);
+                    total += scoring::score(self.method, tf, dl, &params, idf_val);
+                }
+            }
+            scores.push(total);
+        }
+        scores
+    }
+
+    /// Score multiple queries against their respective document lists.
+    /// `queries[i]` is scored against `documents[i]`.
+    pub fn score_batch(&self, queries: &[&str], documents: &[&[&str]]) -> Vec<Vec<f32>> {
+        queries
+            .iter()
+            .zip(documents.iter())
+            .map(|(q, docs)| self.score(q, docs))
+            .collect()
+    }
+
     // --- Internal helpers ---
 
     fn get_or_create_term(&mut self, token: &str) -> u32 {
@@ -800,5 +878,64 @@ mod tests {
 
         let results = index.search("delta", 10);
         assert_eq!(results[0].index, 2);
+    }
+
+    #[test]
+    fn test_score_basic() {
+        let index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let scores = index.score("fox", &["the quick brown fox", "lazy dog", "fox fox fox"]);
+        assert_eq!(scores.len(), 3);
+        assert!(scores[0] > 0.0); // "fox" appears
+        assert_eq!(scores[1], 0.0); // no match
+        assert!(scores[2] > scores[0]); // more "fox" occurrences
+    }
+
+    #[test]
+    fn test_score_empty() {
+        let index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        assert!(index.score("hello", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_score_batch() {
+        let index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let docs1: &[&str] = &["the cat", "the dog"];
+        let docs2: &[&str] = &["rust lang", "python lang", "go lang"];
+        let results = index.score_batch(&["cat", "rust"], &[docs1, docs2]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].len(), 2);
+        assert_eq!(results[1].len(), 3);
+        assert!(results[0][0] > 0.0); // "cat" matches "the cat"
+        assert!(results[1][0] > 0.0); // "rust" matches "rust lang"
+    }
+
+    #[test]
+    fn test_score_matches_index_search() {
+        // Scores from score() should match scores from index+search
+        // when the same documents are used
+        let docs = &[
+            "alpha beta gamma",
+            "beta gamma delta",
+            "gamma delta epsilon",
+        ];
+        let query = "beta gamma";
+
+        let scorer = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let direct_scores = scorer.score(query, docs);
+
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        index.add(docs).unwrap();
+        let results = index.search(query, 10);
+
+        // Every indexed result should have the same score as direct scoring
+        for r in &results {
+            assert!(
+                (r.score - direct_scores[r.index]).abs() < 1e-6,
+                "doc {}: index score {} != direct score {}",
+                r.index,
+                r.score,
+                direct_scores[r.index]
+            );
+        }
     }
 }
