@@ -157,7 +157,7 @@ fn is_empty(&self) -> bool
   <img src="assets/benchmarks.png" alt="bm25x benchmarks" width="100%" />
 </p>
 
-> [BEIR](https://github.com/beir-cellar/beir) datasets. Same or better NDCG@10 than bm25s, **3.5-6x faster** indexing, **1-4x faster** search.
+> [BEIR](https://github.com/beir-cellar/beir) datasets (log scale). Same or better NDCG@10 than bm25s. CPU: **3.5-6x faster** indexing, **1-4x faster** search. GPU (H100): up to **13x faster** indexing, **214x faster** search on MS MARCO 8.8M docs. GPU search has per-query kernel launch overhead, making it best suited for **batch querying** on **large datasets**.
 
 ---
 

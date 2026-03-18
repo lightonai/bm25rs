@@ -12,3 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 bm25x-core = { path = "..", package = "bm25x" }
+
+[features]
+default = []
+cuda = ["bm25x-core/cuda"]
