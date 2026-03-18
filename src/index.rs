@@ -1093,4 +1093,80 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_default_uses_best_config() {
+        // BM25::default() must use the best configuration we benchmarked:
+        // Lucene, k1=1.5, b=0.75, delta=0.5, UnicodeStem, stopwords=true
+        let index = BM25::default();
+        assert_eq!(index.method, Method::Lucene);
+        assert_eq!(index.k1, 1.5);
+        assert_eq!(index.b, 0.75);
+        assert_eq!(index.delta, 0.5);
+    }
+
+    #[test]
+    fn test_default_applies_stemming() {
+        // Default must stem: "running" → "run"
+        let index = BM25::default();
+        let scores = index.score("run", &["running quickly", "sleeping deeply"]);
+        assert!(scores[0] > 0.0, "stemming should match 'run' to 'running'");
+        assert_eq!(scores[1], 0.0);
+    }
+
+    #[test]
+    fn test_default_applies_unicode_folding() {
+        // Default must fold diacritics: "cafe" matches "café"
+        let index = BM25::default();
+        let scores = index.score("cafe", &["café latte", "green tea"]);
+        assert!(
+            scores[0] > 0.0,
+            "unicode folding should match 'cafe' to 'café'"
+        );
+        assert_eq!(scores[1], 0.0);
+    }
+
+    #[test]
+    fn test_default_applies_stopwords() {
+        // Default must remove stopwords: "the" alone should not match
+        let mut index = BM25::default();
+        index.add(&["the quick fox", "lazy dog"]).unwrap();
+        // "the" is a stopword, so querying "the" should return no results
+        let results = index.search("the", 10);
+        assert!(results.is_empty(), "stopwords should be filtered");
+    }
+
+    #[test]
+    fn test_default_scores_match_explicit_best_config() {
+        // BM25::default() must produce identical scores to the explicit best config
+        let docs = &[
+            "the café résumé running cancellation",
+            "quick brown fox jumping",
+            "lazy sleeping dog",
+        ];
+        let query = "running fox café";
+
+        let default_index = BM25::default();
+        let explicit_index = BM25::with_tokenizer(
+            Method::Lucene,
+            1.5,
+            0.75,
+            0.5,
+            TokenizerMode::UnicodeStem,
+            true,
+        );
+
+        let default_scores = default_index.score(query, docs);
+        let explicit_scores = explicit_index.score(query, docs);
+
+        for i in 0..docs.len() {
+            assert!(
+                (default_scores[i] - explicit_scores[i]).abs() < 1e-6,
+                "doc {}: default={} != explicit={}",
+                i,
+                default_scores[i],
+                explicit_scores[i]
+            );
+        }
+    }
 }
