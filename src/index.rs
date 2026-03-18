@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::scoring::{self, Method, ScoringParams};
 use crate::storage::MmapData;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{Tokenizer, TokenizerMode};
 
 /// A scored document result.
 #[derive(Debug, Clone)]
@@ -75,6 +75,18 @@ pub struct BM25 {
 impl BM25 {
     /// Create a new empty index.
     pub fn new(method: Method, k1: f32, b: f32, delta: f32, use_stopwords: bool) -> Self {
+        Self::with_tokenizer(method, k1, b, delta, TokenizerMode::Stem, use_stopwords)
+    }
+
+    /// Create a new empty index with a specific tokenizer mode.
+    pub fn with_tokenizer(
+        method: Method,
+        k1: f32,
+        b: f32,
+        delta: f32,
+        tokenizer_mode: TokenizerMode,
+        use_stopwords: bool,
+    ) -> Self {
         BM25 {
             k1,
             b,
@@ -86,7 +98,7 @@ impl BM25 {
             total_tokens: 0,
             num_docs: 0,
             vocab: HashMap::new(),
-            tokenizer: Tokenizer::new(use_stopwords),
+            tokenizer: Tokenizer::with_mode(tokenizer_mode, use_stopwords),
             mmap_data: None,
             index_path: None,
         }
@@ -103,6 +115,7 @@ impl BM25 {
         k1: f32,
         b: f32,
         delta: f32,
+        tokenizer_mode: TokenizerMode,
         use_stopwords: bool,
     ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -111,7 +124,8 @@ impl BM25 {
             index.index_path = Some(path);
             Ok(index)
         } else {
-            let mut index = Self::new(method, k1, b, delta, use_stopwords);
+            let mut index =
+                Self::with_tokenizer(method, k1, b, delta, tokenizer_mode, use_stopwords);
             index.index_path = Some(path);
             Ok(index)
         }

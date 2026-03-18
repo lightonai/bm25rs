@@ -1,7 +1,7 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use bm25rs_core::Method;
+use bm25rs_core::{Method, TokenizerMode};
 
 fn parse_method(method: &str) -> PyResult<Method> {
     match method.to_lowercase().as_str() {
@@ -11,6 +11,19 @@ fn parse_method(method: &str) -> PyResult<Method> {
         "bm25l" => Ok(Method::BM25L),
         "bm25+" | "bm25plus" => Ok(Method::BM25Plus),
         _ => Err(PyValueError::new_err(format!("Unknown method: {}", method))),
+    }
+}
+
+fn parse_tokenizer(tokenizer: &str) -> PyResult<TokenizerMode> {
+    match tokenizer.to_lowercase().as_str() {
+        "plain" => Ok(TokenizerMode::Plain),
+        "unicode" => Ok(TokenizerMode::Unicode),
+        "stem" => Ok(TokenizerMode::Stem),
+        "unicode_stem" | "unicodestem" => Ok(TokenizerMode::UnicodeStem),
+        _ => Err(PyValueError::new_err(format!(
+            "Unknown tokenizer: {}. Choose from: plain, unicode, stem, unicode_stem",
+            tokenizer
+        ))),
     }
 }
 
@@ -27,23 +40,26 @@ struct PyBM25 {
 impl PyBM25 {
     /// Create a new index.
     ///
-    /// If `index` is provided, the index is persisted to that directory:
-    /// - If the directory already contains a saved index, it is loaded automatically.
-    /// - Every mutation (add, delete, update) auto-saves to disk.
+    /// If `index` is provided, the index is persisted to that directory.
+    /// `tokenizer` can be: "plain", "unicode", "stem", "unicode_stem" (default).
     #[new]
-    #[pyo3(signature = (index=None, method="lucene", k1=1.5, b=0.75, delta=0.5, use_stopwords=true))]
+    #[pyo3(signature = (index=None, method="lucene", k1=1.5, b=0.75, delta=0.5, tokenizer="stem", use_stopwords=true))]
     fn new(
         index: Option<&str>,
         method: &str,
         k1: f32,
         b: f32,
         delta: f32,
+        tokenizer: &str,
         use_stopwords: bool,
     ) -> PyResult<Self> {
         let m = parse_method(method)?;
+        let tok = parse_tokenizer(tokenizer)?;
         let inner = match index {
-            Some(path) => bm25rs_core::BM25::open(path, m, k1, b, delta, use_stopwords).map_err(io_err)?,
-            None => bm25rs_core::BM25::new(m, k1, b, delta, use_stopwords),
+            Some(path) => {
+                bm25rs_core::BM25::open(path, m, k1, b, delta, tok, use_stopwords).map_err(io_err)?
+            }
+            None => bm25rs_core::BM25::with_tokenizer(m, k1, b, delta, tok, use_stopwords),
         };
         Ok(PyBM25 { inner })
     }
@@ -89,19 +105,14 @@ impl PyBM25 {
     }
 
     /// Score a query against a list of documents.
-    /// Returns a list of BM25 scores (one per document).
-    /// If `query` is a list of strings, `documents` must be a list of lists,
-    /// and returns a list of lists of scores.
     fn score(&self, query: &Bound<'_, PyAny>, documents: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let py = query.py();
         if let Ok(q) = query.extract::<String>() {
-            // Single query, single doc list
             let docs: Vec<String> = documents.extract()?;
             let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
             let scores = self.inner.score(&q, &refs);
             Ok(scores.into_pyobject(py)?.into_any().unbind())
         } else {
-            // Batch: list of queries, list of doc lists
             let queries: Vec<String> = query.extract()?;
             let doc_lists: Vec<Vec<String>> = documents.extract()?;
             let q_refs: Vec<&str> = queries.iter().map(|s| s.as_str()).collect();
