@@ -36,7 +36,7 @@ impl Ord for MinScored {
 }
 
 /// The core BM25 index.
-pub struct BM25Index {
+pub struct BM25 {
     // Scoring parameters
     pub k1: f32,
     pub b: f32,
@@ -70,10 +70,10 @@ pub struct BM25Index {
     mmap_data: Option<MmapData>,
 }
 
-impl BM25Index {
+impl BM25 {
     /// Create a new empty index.
     pub fn new(method: Method, k1: f32, b: f32, delta: f32, use_stopwords: bool) -> Self {
-        BM25Index {
+        BM25 {
             k1,
             b,
             delta,
@@ -548,7 +548,7 @@ impl BM25Index {
     }
 }
 
-impl Default for BM25Index {
+impl Default for BM25 {
     fn default() -> Self {
         Self::new(Method::Lucene, 1.5, 0.75, 0.5, true)
     }
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_add_and_search() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         let ids = index.add(&[
             "the quick brown fox jumps over the lazy dog",
             "a fast brown car drives over the bridge",
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&["hello world", "foo bar", "hello foo"]);
         assert_eq!(index.len(), 3);
 
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_update() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&["hello world", "foo bar"]);
 
         // Update doc 0 to no longer contain "hello"
@@ -607,14 +607,14 @@ mod tests {
 
     #[test]
     fn test_empty_search() {
-        let index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         let results = index.search("anything", 10);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_streaming_add() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         let ids1 = index.add(&["first document"]);
         let ids2 = index.add(&["second document"]);
         assert_eq!(ids1, vec![0]);
@@ -634,7 +634,7 @@ mod tests {
             Method::BM25L,
             Method::BM25Plus,
         ] {
-            let mut index = BM25Index::new(method, 1.5, 0.75, 0.5, false);
+            let mut index = BM25::new(method, 1.5, 0.75, 0.5, false);
             // Use enough docs so Robertson IDF doesn't clamp all terms to 0
             index.add(&[
                 "the cat sat on the mat",
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_search_filtered_basic() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&[
             "the quick brown fox",  // 0
             "the lazy brown dog",   // 1
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn test_search_filtered_respects_k() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&[
             "apple banana cherry",   // 0
             "apple date elderberry", // 1
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_search_filtered_empty_filter() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&["hello world", "foo bar"]);
 
         let results = index.search_filtered("hello", 10, &[]);
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_search_filtered_no_overlap() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&[
             "the quick brown fox", // 0
             "the lazy dog",        // 1
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_search_filtered_with_deletions() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&[
             "alpha beta gamma", // 0
             "alpha delta",      // 1
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_search_filtered_scores_match_unfiltered() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&[
             "rust is fast and safe",    // 0
             "python is slow but easy",  // 1

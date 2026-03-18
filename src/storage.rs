@@ -5,7 +5,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::index::BM25Index;
+use crate::index::BM25;
 use crate::scoring::Method;
 
 const MAGIC: u64 = 0x424D32355253; // "BM25RS" in hex
@@ -143,7 +143,7 @@ impl MmapData {
     }
 }
 
-impl BM25Index {
+impl BM25 {
     /// Save the index to a directory.
     pub fn save<P: AsRef<Path>>(&self, dir: P) -> io::Result<()> {
         let dir = dir.as_ref();
@@ -243,7 +243,7 @@ impl BM25Index {
         let deleted: HashSet<u32> =
             bincode::deserialize(&deleted_bytes).map_err(io::Error::other)?;
 
-        let mut index = BM25Index::new(method, k1, b, delta, true);
+        let mut index = BM25::new(method, k1, b, delta, true);
 
         if mmap {
             let doc_lens_file = File::open(dir.join("doc_lens.bin"))?;
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&[
             "the quick brown fox",
             "the lazy dog",
@@ -411,7 +411,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         index.save(dir.path()).unwrap();
 
-        let loaded = BM25Index::load(dir.path(), false).unwrap();
+        let loaded = BM25::load(dir.path(), false).unwrap();
         assert_eq!(loaded.len(), 3);
 
         let results = loaded.search("quick fox", 10);
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_mmap() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&[
             "the quick brown fox",
             "the lazy dog",
@@ -430,7 +430,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         index.save(dir.path()).unwrap();
 
-        let loaded = BM25Index::load(dir.path(), true).unwrap();
+        let loaded = BM25::load(dir.path(), true).unwrap();
         assert_eq!(loaded.len(), 3);
 
         let results = loaded.search("quick fox", 10);
@@ -439,14 +439,14 @@ mod tests {
 
     #[test]
     fn test_save_load_with_deletions() {
-        let mut index = BM25Index::new(Method::Lucene, 1.5, 0.75, 0.5, false);
+        let mut index = BM25::new(Method::Lucene, 1.5, 0.75, 0.5, false);
         index.add(&["hello world", "foo bar", "hello foo"]);
         index.delete(&[1]);
 
         let dir = TempDir::new().unwrap();
         index.save(dir.path()).unwrap();
 
-        let loaded = BM25Index::load(dir.path(), false).unwrap();
+        let loaded = BM25::load(dir.path(), false).unwrap();
         assert_eq!(loaded.len(), 2);
 
         let results = loaded.search("foo", 10);

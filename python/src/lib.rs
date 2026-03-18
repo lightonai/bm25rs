@@ -1,7 +1,7 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use bm25rs::{BM25Index, Method};
+use bm25rs::Method;
 
 fn parse_method(method: &str) -> PyResult<Method> {
     match method.to_lowercase().as_str() {
@@ -14,13 +14,13 @@ fn parse_method(method: &str) -> PyResult<Method> {
     }
 }
 
-#[pyclass]
-struct PyBM25Index {
-    inner: BM25Index,
+#[pyclass(name = "BM25")]
+struct PyBM25 {
+    inner: bm25rs::BM25,
     index_path: Option<String>,
 }
 
-impl PyBM25Index {
+impl PyBM25 {
     fn auto_save(&self) -> PyResult<()> {
         if let Some(ref path) = self.index_path {
             self.inner
@@ -32,7 +32,7 @@ impl PyBM25Index {
 }
 
 #[pymethods]
-impl PyBM25Index {
+impl PyBM25 {
     /// Create a new index.
     ///
     /// If `index` is provided, the index is persisted to that directory:
@@ -48,13 +48,12 @@ impl PyBM25Index {
         delta: f32,
         use_stopwords: bool,
     ) -> PyResult<Self> {
-        // If path given and already contains an index, load it
         if let Some(path) = index {
             let header = std::path::Path::new(path).join("header.bin");
             if header.exists() {
-                let inner = BM25Index::load(path, true)
+                let inner = bm25rs::BM25::load(path, true)
                     .map_err(|e| PyValueError::new_err(format!("Load failed: {}", e)))?;
-                return Ok(PyBM25Index {
+                return Ok(PyBM25 {
                     inner,
                     index_path: Some(path.to_string()),
                 });
@@ -62,8 +61,8 @@ impl PyBM25Index {
         }
 
         let m = parse_method(method)?;
-        Ok(PyBM25Index {
-            inner: BM25Index::new(m, k1, b, delta, use_stopwords),
+        Ok(PyBM25 {
+            inner: bm25rs::BM25::new(m, k1, b, delta, use_stopwords),
             index_path: index.map(|s| s.to_string()),
         })
     }
@@ -112,9 +111,9 @@ impl PyBM25Index {
     #[staticmethod]
     #[pyo3(signature = (index, mmap=false))]
     fn load(index: &str, mmap: bool) -> PyResult<Self> {
-        let inner = BM25Index::load(index, mmap)
+        let inner = bm25rs::BM25::load(index, mmap)
             .map_err(|e| PyValueError::new_err(format!("Load failed: {}", e)))?;
-        Ok(PyBM25Index {
+        Ok(PyBM25 {
             inner,
             index_path: Some(index.to_string()),
         })
@@ -128,6 +127,6 @@ impl PyBM25Index {
 
 #[pymodule]
 fn bm25rs_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyBM25Index>()?;
+    m.add_class::<PyBM25>()?;
     Ok(())
 }
